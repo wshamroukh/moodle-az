@@ -1,0 +1,1 @@
+Scripts to deploy Moodle on Azure VM
