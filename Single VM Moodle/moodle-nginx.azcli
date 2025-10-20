@@ -1,0 +1,97 @@
+rg=moodle-nginx-mariadb
+location1=centralindia
+
+moodle_vnet_name=moodle
+moodle_vnet_address=10.1.0.0/16
+moodle_subnet_name=moodle
+moodle_subnet_address=10.1.0.0/24
+
+admin_username=$(whoami)
+myip=$(curl -s4 https://ifconfig.co/)
+admin_password=Test#123#123
+vm_size=Standard_B4als_v2
+
+
+# https://shape.host/resources/how-to-install-moodle-lms-on-ubuntu-24-04-server
+
+cloudinit_file=cloudinit.txt
+cat <<EOF > $cloudinit_file
+#cloud-config
+runcmd:
+  - apt update && apt install -y unzip nginx mariadb-server php-fpm php-intl php-mysql php-curl php-cli php-zip php-xml php-gd php-common php-mbstring php-xmlrpc php-json php-sqlite3 php-soap php-zip
+  - systemctl enable nginx && systemctl enable mariadb
+  - cd /tmp/ && wget https://download.moodle.org/download.php/direct/stable405/moodle-latest-405.tgz && tar -xf moodle-latest-405.tgz && mv moodle /var/www/
+  - mkdir -p /var/www/moodledata && chown -R www-data:www-data /var/www/moodledata/ && chown -R www-data:www-data /var/www/moodle/ && chmod u+rwx /var/www/moodle /var/www/moodledata
+  - mysql -e "CREATE DATABASE moodle DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  - mysql -e "CREATE USER 'moodleuser'@'localhost' IDENTIFIED BY '$admin_password';"
+  - mysql -e "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, CREATE TEMPORARY TABLES, DROP, INDEX, ALTER ON moodle.* TO 'moodleuser'@'localhost';"
+  - mysql -e "FLUSH PRIVILEGES;"
+  - sed -i 's/^;max_input_vars =.*/max_input_vars = 5000/' /etc/php/8.3/fpm/php.ini
+  - sed -i 's/^;max_input_vars =.*/max_input_vars = 5000/' /etc/php/8.3/cli/php.ini
+  - sed -i 's/^post_max_size =.*/post_max_size = 256M/' /etc/php/8.3/fpm/php.ini
+  - sed -i 's/^post_max_size =.*/post_max_size = 256M/' /etc/php/8.3/cli/php.ini
+  - sed -i 's/^upload_max_filesize =.*/upload_max_filesize = 256M/' /etc/php/8.3/fpm/php.ini
+  - sed -i 's/^upload_max_filesize =.*/upload_max_filesize = 256M/' /etc/php/8.3/cli/php.ini
+  - systemctl reload php8.3-fpm
+  - systemctl restart nginx
+  - |
+    cat <<'EOT' | sudo tee /etc/nginx/sites-available/moodle.conf > /dev/null
+    server {
+        listen 80;
+        server_name \$(curl -s4 ifconfig.io);
+        root /var/www/moodle;
+        index index.php index.html index.htm;
+
+        location / {
+            try_files \$uri \$uri/ /index.php?\$args /r.php;
+        }
+
+        location ~ [^/]\.php(/|$) {
+            fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+            fastcgi_index index.php;
+            include fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+            fastcgi_param PATH_INFO \$fastcgi_path_info;
+            fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;
+        }
+
+        location ~ /\.ht {
+            deny all;
+        }
+    }
+    EOT
+  - IP=\$(curl -s4 ifconfig.io) && sed -i "s/server_name \\\$(curl -s4 ifconfig.io)/server_name \$IP/" /etc/nginx/sites-available/moodle.conf
+  - ln -s /etc/nginx/sites-available/moodle.conf /etc/nginx/sites-enabled/
+  - systemctl restart nginx
+  - sudo -u www-data /usr/bin/php /var/www/moodle/admin/cli/install.php --non-interactive --lang=en --wwwroot="http://\$(curl -s4 ifconfig.io)" --dataroot=/var/www/moodledata --dbtype=mariadb --dbhost=localhost --dbname=moodle --dbuser=moodleuser --dbpass="$admin_password" --fullname="Generic Moodle" --shortname="GM" --adminuser=admin --summary="" --adminpass="$admin_password" --adminemail=please@changeme.com --agree-license  --allow-unstable
+EOF
+
+# Resource Groups
+echo -e "\e[1;36mCreating $rg Resource Group...\e[0m"
+az group create -l $location1 -n $rg -o none
+
+# moodle vnet
+echo -e "\e[1;36mCreating $moodle_vnet_name VNet...\e[0m"
+az network vnet create -g $rg -n $moodle_vnet_name -l $location1 --address-prefixes $moodle_vnet_address --subnet-name $moodle_subnet_name --subnet-prefixes $moodle_subnet_address -o none
+
+# moodle vm
+echo -e "\e[1;36mDeploying $moodle_vnet_name VM...\e[0m"
+az network public-ip create -g $rg -n $moodle_vnet_name -l $location1 --allocation-method Static --sku Basic -o none
+az network nic create -g $rg -n $moodle_vnet_name -l $location1 --vnet-name $moodle_vnet_name --subnet $moodle_subnet_name --public-ip-address $moodle_vnet_name -o none
+az vm create -g $rg -n $moodle_vnet_name -l $location1 --image Ubuntu2404 --nics $moodle_vnet_name --os-disk-name $moodle_vnet_name --size $vm_size --admin-username $admin_username --generate-ssh-keys --custom-data $cloudinit_file --no-wait
+moodle_vm_pubip=$(az network public-ip show -g $rg -n $moodle_vnet_name --query ipAddress -o tsv | tr -d '\r') && echo $moodle_vnet_name vm public ip: $moodle_vm_pubip
+moodle_vm_ip=$(az network nic show -g $rg -n $moodle_vnet_name --query ipConfigurations[0].privateIPAddress -o tsv | tr -d '\r') && echo $moodle_vnet_name vm private ip: $moodle_vm_ip
+
+## NSGs
+# moodle vm nsg
+echo -e "\e[1;36mCreating $moodle_vnet_name NSG...\e[0m"
+az network nsg create -g $rg -n $moodle_vnet_name -l $location1 -o none
+az network nsg rule create -g $rg -n AllowSSH --nsg-name $moodle_vnet_name --priority 1000 --access Allow --description AllowSSH --protocol Tcp --direction Inbound --destination-address-prefixes '*' --destination-port-ranges 22 --source-address-prefixes $myip --source-port-ranges '*' -o none
+az network nsg rule create -g $rg -n AllowHTTP --nsg-name $moodle_vnet_name --priority 1001 --access Allow --description AllowHTTP --protocol Tcp --direction Inbound --destination-address-prefixes '*' --destination-port-ranges 80 --source-address-prefixes '*' --source-port-ranges '*' -o none
+az network vnet subnet update -g $rg -n $moodle_subnet_name --vnet-name $moodle_vnet_name --nsg $moodle_vnet_name -o none
+
+echo -e "\e[1;32mDeployment initiated. Moodle VM is being set up. It may take a few minutes to complete. You can browse to http://$moodle_vm_pubip to complete the setup\e[0m"
+
+#cleanup
+rm $cloudinit_file
+# az group delete -g $rg -y --no-wait
